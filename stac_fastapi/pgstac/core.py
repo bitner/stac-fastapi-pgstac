@@ -1,6 +1,7 @@
 """Item crud client."""
 import re
 from datetime import datetime
+from time import time
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import unquote_plus, urljoin
 
@@ -151,14 +152,17 @@ class CoreCrudClient(AsyncBaseCoreClient):
         Returns:
             ItemCollection containing items which match the search criteria.
         """
+        t0 = time()
+        timing = {}
         items: Dict[str, Any]
 
         settings: Settings = request.app.state.settings
 
         search_request.conf = search_request.conf or {}
         search_request.conf["nohydrate"] = settings.use_api_hydrate
+        search_request.conf['timing'] = True
         search_request_json = search_request.json(exclude_none=True, by_alias=True)
-
+        timing['prequery'] = (time() - t0)
         try:
             async with request.app.state.get_connection(request, "r") as conn:
                 q, p = render(
@@ -172,10 +176,17 @@ class CoreCrudClient(AsyncBaseCoreClient):
             raise InvalidQueryParameter(
                 f"Datetime parameter {search_request.datetime} is invalid."
             )
+        timing['postquery'] = (time() - t0)
+
 
         next: Optional[str] = items.pop("next", None)
         prev: Optional[str] = items.pop("prev", None)
+        tquery = items.pop("timing", None)
+        if tquery:
+            timing['dbquery'] = tquery / 1000
+
         collection = ItemCollection(**items)
+        timing['postitemcollection'] = (time() - t0)
 
         exclude = search_request.fields.exclude
         if exclude and len(exclude) == 0:
@@ -183,6 +194,8 @@ class CoreCrudClient(AsyncBaseCoreClient):
         include = search_request.fields.include
         if include and len(include) == 0:
             include = None
+
+        timing['postincludeexclude'] = (time() - t0)
 
         async def _add_item_links(
             feature: Item,
@@ -231,10 +244,12 @@ class CoreCrudClient(AsyncBaseCoreClient):
                 await _add_item_links(feature, collection_id, item_id)
 
                 cleaned_features.append(feature)
+                timing['posthydrate'] = (time() - t0)
         else:
             for feature in collection.get("features") or []:
                 await _add_item_links(feature)
                 cleaned_features.append(feature)
+                timing['postaddlinks'] = (time() - t0)
 
         collection["features"] = cleaned_features
         collection["links"] = await PagingLinks(
@@ -242,6 +257,22 @@ class CoreCrudClient(AsyncBaseCoreClient):
             next=next,
             prev=prev,
         ).get_links()
+        timing['prereturn'] = (time() - t0)
+        collection['timing'] = timing
+
+        async with request.app.state.get_connection(request, "r") as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pgstac.stacfastapi_timings (timing jsonb, ts timestamptz DEFAULT now());
+                """
+            )
+            q, p = render(
+                """
+                INSERT INTO pgstac.stacfastapi_timings (timing) VALUES (:timing::text::jsonb);
+                """,
+                timing=orjson.dumps(timing).decode(),
+            )
+            items = await conn.execute(q, *p)
         return collection
 
     async def item_collection(
