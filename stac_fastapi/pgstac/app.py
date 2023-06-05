@@ -6,7 +6,10 @@ If the variable is not set, enables all extensions.
 """
 
 import os
+from time import time
+from typing import Dict
 
+from fastapi import Request
 from fastapi.responses import ORJSONResponse
 from stac_fastapi.api.app import StacApi
 from stac_fastapi.api.models import create_get_request_model, create_post_request_model
@@ -27,6 +30,9 @@ from stac_fastapi.pgstac.extensions import QueryExtension
 from stac_fastapi.pgstac.extensions.filter import FiltersClient
 from stac_fastapi.pgstac.transactions import BulkTransactionsClient, TransactionsClient
 from stac_fastapi.pgstac.types.search import PgstacSearch
+
+# from stac_fastapi.pgstac.middleware import ServerTimingMiddleware
+
 
 settings = Settings()
 extensions_map = {
@@ -63,6 +69,31 @@ api = StacApi(
     search_post_request_model=post_request_model,
 )
 app = api.app
+
+
+def timing_header(timing: Dict) -> str:
+    """Create header string from dict of timings."""
+    return ",".join(
+        [f"{name};dur={(duration*1000):.3f}" for name, duration in timing.items()]
+    )
+
+
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    """Middleware to add timings to server-timing header."""
+    request.state.timings = {}
+    request.state.start_time = time()
+    request.state.last_time = time()
+    response = await call_next(request)
+    process_time = time() - request.state.start_time
+    request.state.timings["999-process_time"] = process_time
+
+    if request.query_params.get("timingonly"):
+        response = ORJSONResponse(content=request.state.timings, status_code=200)
+
+    response.headers["server-timing"] = timing_header(request.state.timings)
+
+    return response
 
 
 @app.on_event("startup")
